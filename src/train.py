@@ -11,6 +11,8 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from pathlib import Path
 import json
 import wandb
+import re
+from datetime import datetime
 
 from .config import (
     DEVICE,
@@ -22,6 +24,44 @@ from .config import (
     PIN_MEMORY,
     CHECKPOINTS_DIR
 )
+
+
+def get_next_folder(base_name: str, base_dir: Path = CHECKPOINTS_DIR) -> Path:
+    """
+    Get the next available folder 
+    """
+    # Increments Non-Unique Folders 
+    pattern = re.compile(rf"{re.escape(base_name)}_(\d+)$")
+    
+    # Find all existing folders with this base name
+    existing_runs = []
+    for item in base_dir.iterdir():
+        if item.is_dir():
+            match = pattern.match(item.name)
+            if match:
+                existing_runs.append(int(match.group(1)))
+    
+    # Get the next number
+    if existing_runs:
+        next_number = max(existing_runs) + 1 
+        run_folder = base_dir / f"{base_name}_{next_number}"
+    else:
+        run_folder = base_dir / f"{base_name}"
+
+    run_folder.mkdir(parents=True, exist_ok=True)
+    
+    return run_folder
+
+
+def save_training_parameters(run_folder: Path, parameters: dict) -> None:
+    params_path = run_folder / "training_parameters.json"
+    
+    parameters['timestamp'] = datetime.now().isoformat()
+    
+    with open(params_path, 'w') as f:
+        json.dump(parameters, f, indent=2, default=str)
+    
+    print(f"Training parameters saved to: {params_path}")
 
 
 def train_epoch(
@@ -180,6 +220,28 @@ def train_model(
     history : dict
         Dictionary with training history
     """
+    run_folder = get_next_folder(f"{model_name}")
+
+    training_parameters = {
+        'model_name': model_name,
+        'model_architecture': type(model).__name__,
+        'num_epochs': num_epochs,
+        'batch_size': batch_size,
+        'learning_rate': DEFAULT_LEARNING_RATE,
+        'warmup_steps': DEFAULT_WARMUP_STEPS,
+        'device': str(device),
+        'num_workers': NUM_WORKERS,
+        'pin_memory': PIN_MEMORY,
+        'optimizer': type(optimizer).__name__,
+        'optimizer_params': {
+            'lr': optimizer.param_groups[0]['lr'],
+            'weight_decay': optimizer.param_groups[0].get('weight_decay', 0),
+            'betas': optimizer.param_groups[0].get('betas', (0.9, 0.999))
+        },
+        'run_folder': run_folder.name,
+        'train_dataset_size': len(train_dataset),
+        'val_dataset_size': len(val_dataset)
+    }
 
     if use_wandb:
         if wandb_config is None:
@@ -189,11 +251,12 @@ def train_model(
                 "epochs": num_epochs,
                 "model_name": model_name,
                 "architecture": type(model).__name__,
+                "run_folder": run_folder.name
             }
         
         wandb.init(
             project="emotion-classification",
-            name=model_name,
+            name=f"{model_name}_{run_folder.name}",
             config=wandb_config
         )
 
@@ -224,6 +287,12 @@ def train_model(
         num_training_steps=num_training_steps
     )
     
+    training_parameters['lr_scheduler'] = {
+        'type': 'linear',
+        'num_training_steps': num_training_steps,
+        'num_warmup_steps': DEFAULT_WARMUP_STEPS
+    }
+    
     model.to(device)
     
     # Training history
@@ -243,7 +312,9 @@ def train_model(
     best_val_acc = 0.0
     
     if save_path is None:
-        save_path = CHECKPOINTS_DIR / f"best_{model_name}.pth"
+        save_path = run_folder / f"best_{model_name}.pth"
+    
+    save_training_parameters(run_folder, training_parameters)
     
     print(f"Training {model_name} for {num_epochs} epochs...")
     print(f"Total training steps: {num_training_steps}")
@@ -251,6 +322,7 @@ def train_model(
     print(f"Batch size: {batch_size}")
     print(f"Train batches: {len(train_loader)}")
     print(f"Val batches: {len(val_loader)}")
+    print(f"Run folder: {run_folder}")
     print(f"Best model will be saved to: {save_path}")
     if use_wandb:
         print(f"W&B tracking: {wandb.run.url}")
@@ -320,8 +392,16 @@ def train_model(
     print("Training completed!")
     print(f"Best validation accuracy: {best_val_acc:.4f}")
     
-    # Save Final History
-    history_path = CHECKPOINTS_DIR / f"history_{model_name}.json"
+    training_parameters['final_metrics'] = {
+        'best_val_accuracy': best_val_acc,
+        'final_val_f1': history['val_f1'][-1],
+        'final_train_accuracy': history['train_acc'][-1]
+    }
+    
+    # Save History
+    save_training_parameters(run_folder, training_parameters)
+    history_path = run_folder / f"history_{model_name}.json"
+
     with open(history_path, 'w') as f:
         json.dump(history, f, indent=2)
     print(f"Training history saved to: {history_path}")
@@ -330,7 +410,7 @@ def train_model(
     if use_wandb:
         wandb.finish()
     
-    return model, history
+    return model, history, run_folder
 
 
 def load_checkpoint(
