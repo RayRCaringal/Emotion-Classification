@@ -1,0 +1,43 @@
+"""
+Configuration settings for emotion classification project.
+"""
+
+import torch
+from pathlib import Path
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Dataset 
+NUM_LABELS = 7
+EMOTION_LABELS = ['Angry', 'Disgust', 'Fear', 'Happy', 'Sad', 'Surprise', 'Neutral']
+
+# Model
+DEFAULT_MODEL_NAME = "google/vit-base-patch16-224"
+
+# Hyperparameters
+DEFAULT_BATCH_SIZE = 32
+DEFAULT_NUM_EPOCHS = 5
+DEFAULT_LEARNING_RATE = 2e-5
+DEFAULT_WARMUP_STEPS = 500
+
+# Device Configuration
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Paths
+PROJECT_ROOT = Path(__file__).parent.parent
+CHECKPOINTS_DIR = PROJECT_ROOT / "checkpoints"
+RESULTS_DIR = PROJECT_ROOT / "results"
+
+CHECKPOINTS_DIR.mkdir(exist_ok=True)
+RESULTS_DIR.mkdir(exist_ok=True)
+
+# DataLoader 
+NUM_WORKERS = 2
+PIN_MEMORY = True if torch.cuda.is_available() else False
+
+# Weights & Biases Configuration
+WANDB_API_KEY = os.getenv('WANDB_API_KEY')
+WANDB_PROJECT = "emotion-classification"

@@ -1,8 +1,7 @@
 
-# Emotion Classifier using ViT
-- Utilizes Hugging Face Datasets 
+# Emotion Classifier ViT Fined-Tuned Using FER2013 
+- Utilizes Hugging Face Datasets: 
 https://huggingface.co/datasets/AutumnQiu/fer2013
-
 
 
 ## FER2013 Emotion Labeling Map
