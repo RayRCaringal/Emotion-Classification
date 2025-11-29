@@ -2,21 +2,23 @@
 FER2013 Dataset.
 """
 
-from datasets import load_dataset
-from torch.utils.data import Dataset
-from PIL import Image
-import numpy as np
-from typing import Optional, List, Tuple, Any
+from typing import Any
+
 import albumentations as A
+import numpy as np
+from datasets import load_dataset
+from PIL import Image
+from torch.utils.data import Dataset
+
 
 class FER2013Dataset(Dataset):
     """
     FER2013 Dataset for emotion classification.
     """
-    
-    def __init__(self, split: str = "train", transform: Optional[A.Compose] = None):
+
+    def __init__(self, split: str = "train", transform: A.Compose | None = None):
         """
-        
+
         Parameters
         ----------
         split : optional
@@ -31,7 +33,7 @@ class FER2013Dataset(Dataset):
     def __len__(self) -> int:
         return len(self.dataset)
 
-    def __getitem__(self, idx: int) -> Tuple[Any, int]:
+    def __getitem__(self, idx: int) -> tuple[Any, int]:
         """
         Returns
         -------
@@ -41,28 +43,30 @@ class FER2013Dataset(Dataset):
             - label: Emotion label (0-6)
         """
         item = self.dataset[idx]
-        
+
         img = item["image"]
         if isinstance(img, Image.Image):
             img = np.array(img)
         else:
             img = np.array(img.convert("RGB"))
-        
+
         # Apply transforms
         if self.transform:
             img = self.transform(image=img)["image"]
-        
+
         label = item["label"]
         return img, label
 
 
-def get_datasets(augmentations_list: Optional[List[A.BasicTransform]] = None) -> Tuple[FER2013Dataset, FER2013Dataset, FER2013Dataset]:
+def get_datasets(
+    augmentations_list: list[A.BasicTransform] | None = None,
+) -> tuple[FER2013Dataset, FER2013Dataset, FER2013Dataset]:
     """
     Parameters
     ----------
     augmentations_list : optional
         List of transforms to apply during training,
-  
+
     Returns
     -------
         Tuple containing:
@@ -70,9 +74,11 @@ def get_datasets(augmentations_list: Optional[List[A.BasicTransform]] = None) ->
         - val_dataset
         - test_dataset
     """
-    from src.transforms import get_transformations, base_transform
-    
-    train = FER2013Dataset(split="train", transform=get_transformations(augmentations_list))
+    from src.transforms import base_transform, get_transformations
+
+    train = FER2013Dataset(
+        split="train", transform=get_transformations(augmentations_list)
+    )
     val = FER2013Dataset(split="valid", transform=base_transform())
     test = FER2013Dataset(split="test", transform=base_transform())
 
