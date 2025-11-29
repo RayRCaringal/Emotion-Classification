@@ -1,0 +1,20 @@
+exclude = [
+  ".venv",
+  "__pycache__",
+  "build",
+  "dist",
+  "*.egg-info",
+  "notebooks",
+  "checkpoints",
+]
+ignore = ["E501", "C901"]
+line-length = 88
+select = ["E", "W", "F", "I", "UP"]
+target-version = "py311"
+
+[format]
+indent-style = "space"
+quote-style = "double"
+
+[isort]
+known-first-party = ["src"]

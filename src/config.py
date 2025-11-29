@@ -2,17 +2,18 @@
 Configuration settings for emotion classification project.
 """
 
-import torch
-from pathlib import Path
 import os
+from pathlib import Path
+
+import torch
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
 
-# Dataset 
+# Dataset
 NUM_LABELS = 7
-EMOTION_LABELS = ['Angry', 'Disgust', 'Fear', 'Happy', 'Sad', 'Surprise', 'Neutral']
+EMOTION_LABELS = ["Angry", "Disgust", "Fear", "Happy", "Sad", "Surprise", "Neutral"]
 
 # Model
 DEFAULT_MODEL_NAME = "google/vit-base-patch16-224"
@@ -34,10 +35,11 @@ RESULTS_DIR = PROJECT_ROOT / "results"
 CHECKPOINTS_DIR.mkdir(exist_ok=True)
 RESULTS_DIR.mkdir(exist_ok=True)
 
-# DataLoader 
+# DataLoader
 NUM_WORKERS = 2
 PIN_MEMORY = True if torch.cuda.is_available() else False
 
 # Weights & Biases Configuration
-WANDB_API_KEY = os.getenv('WANDB_API_KEY')
+WANDB_API_KEY = os.getenv("WANDB_API_KEY")
 WANDB_PROJECT = "emotion-classification"
+WANDB_DIR = "wandb"
