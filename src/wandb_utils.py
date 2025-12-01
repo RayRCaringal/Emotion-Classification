@@ -46,6 +46,8 @@ def login(
 
 
 def retry_on_connection_error(max_retries=3, delay=2):
+    """Decorator to retry WandB operations on connection errors"""
+
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -177,7 +179,6 @@ def finish_wandb_run(quiet: bool = False):
             print("No active WandB run to finish")
 
 
-# In an attempt to resolve the Connectione Timeout Errors
 def cleanup_wandb_run():
     try:
         if wandb.run is not None:
@@ -193,25 +194,167 @@ def cleanup_wandb_run():
         return False
 
 
-def sync_offline_runs():
+def sync_offline_runs(run_path: str | Path | None = None, all_runs: bool = False):
     """
-    Sync all offline WandB runs.
+    Sync offline WandB runs to the cloud.
+
+    Parameters
+    ----------
+    run_path : str | Path | None
+        Specific run to sync (e.g., "wandb/offline-run-20231201_123456-abc123")
+        If None and all_runs=False, will list available runs
+    all_runs : bool
+        If True, sync all offline runs in the WANDB_DIR
+
+    Returns
+    -------
+    bool
+        True if sync succeeded, False otherwise
+
+    Examples
+    --------
+    # List available runs
+    >>> sync_offline_runs()
+
+    # Sync all runs
+    >>> sync_offline_runs(all_runs=True)
+
+    # Sync specific run
+    >>> sync_offline_runs("wandb/offline-run-20231201_123456-abc123")
     """
-    print("Syncing offline runs...")
+    wandb_dir = Path(WANDB_DIR)
 
-    try:
-        result = subprocess.run(
-            ["wandb", "sync", "wandb/"], capture_output=True, text=True, check=True
-        )
-        print("Offline runs synced successfully!")
-        if result.stdout:
-            print("Sync output:", result.stdout)
-        return True
-
-    except Exception as e:
-        print("Failed to Sync Offline Runs:")
-        print(f"Unexpected Error: {e}")
+    # Check if wandb directory exists
+    if not wandb_dir.exists():
+        print(f"❌ WandB directory not found: {wandb_dir}")
         return False
+
+    # Get list of offline runs
+    offline_runs = [
+        d
+        for d in wandb_dir.iterdir()
+        if d.is_dir() and d.name.startswith("offline-run")
+    ]
+
+    if not offline_runs:
+        print("No offline runs found to sync")
+        return False
+
+    # If no specific run and not syncing all, just list available runs
+    if run_path is None and not all_runs:
+        print(f"Found {len(offline_runs)} offline run(s) to sync:")
+        for i, run in enumerate(offline_runs, 1):
+            size_mb = get_folder_size_mb(run)
+            print(f"  {i}. {run.name} ({size_mb:.1f} MB)")
+        print("\nTo sync:")
+        print("  - All runs: sync_offline_runs(all_runs=True)")
+        print("  - Most recent: sync_latest_offline_run()")
+        print(f"  - Specific run: sync_offline_runs('{offline_runs[0]}')")
+        return False
+
+    # Determine what to sync
+    if all_runs:
+        sync_targets = offline_runs
+        print(f"Syncing all {len(sync_targets)} offline runs...")
+    else:
+        sync_target = Path(run_path)
+        if not sync_target.exists():
+            print(f"❌ Run path not found: {sync_target}")
+            return False
+        sync_targets = [sync_target]
+        print(f"Syncing run: {sync_target.name}")
+
+    # Sync each target
+    success_count = 0
+    fail_count = 0
+
+    for target in sync_targets:
+        try:
+            print(f"\n  Syncing: {target.name}...")
+            result = subprocess.run(
+                ["wandb", "sync", str(target)],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=300,  # 5 minute timeout per run
+            )
+
+            if result.returncode == 0:
+                print(f"  ✅ Synced: {target.name}")
+                success_count += 1
+
+                # Show output if there's useful info
+                if result.stdout and "View run at:" in result.stdout:
+                    # Extract and show the URL
+                    for line in result.stdout.split("\n"):
+                        if "View run at:" in line or "https://" in line:
+                            print(f"     {line.strip()}")
+            else:
+                print(f"  ⚠️  Warning: {target.name} returned code {result.returncode}")
+                if result.stderr:
+                    print(f"     Error: {result.stderr}")
+                fail_count += 1
+
+        except subprocess.TimeoutExpired:
+            print(f"  ❌ Timeout syncing: {target.name}")
+            fail_count += 1
+
+        except subprocess.CalledProcessError as e:
+            print(f"  ❌ Failed to sync: {target.name}")
+            print(f"     Return code: {e.returncode}")
+            if e.stderr:
+                print(f"     Error: {e.stderr}")
+            fail_count += 1
+
+        except FileNotFoundError:
+            print("  ❌ 'wandb' command not found. Is wandb installed?")
+            print("     Install with: pip install wandb")
+            return False
+
+        except Exception as e:
+            print(f"  ❌ Unexpected error syncing {target.name}: {e}")
+            fail_count += 1
+
+    # Summary
+    print("\n" + "=" * 70)
+    print(f"Sync complete: {success_count} succeeded, {fail_count} failed")
+    print("=" * 70)
+
+    return fail_count == 0
+
+
+def sync_latest_offline_run():
+    """
+    Sync only the most recent offline run.
+    Useful for syncing after a single training session.
+
+    Returns
+    -------
+    bool
+        True if sync succeeded, False otherwise
+    """
+    wandb_dir = Path(WANDB_DIR)
+
+    if not wandb_dir.exists():
+        print(f"❌ WandB directory not found: {wandb_dir}")
+        return False
+
+    # Get all offline runs sorted by modification time (most recent first)
+    offline_runs = [
+        d
+        for d in wandb_dir.iterdir()
+        if d.is_dir() and d.name.startswith("offline-run")
+    ]
+
+    if not offline_runs:
+        print("No offline runs found to sync")
+        return False
+
+    # Sort by modification time
+    latest_run = max(offline_runs, key=lambda p: p.stat().st_mtime)
+
+    print(f"Latest offline run: {latest_run.name}")
+    return sync_offline_runs(str(latest_run))
 
 
 def list_offline_runs():

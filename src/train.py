@@ -2,21 +2,17 @@
 Training functions for fine tuning.
 """
 
-import json
-import re
-from datetime import datetime
 from pathlib import Path
 
 import torch
 import wandb
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import get_scheduler
 
 from src.backup import BackupManager
+from src.checkpoint_utils import save_checkpoint
 from src.config import (
-    CHECKPOINTS_DIR,
     DEFAULT_BATCH_SIZE,
     DEFAULT_LEARNING_RATE,
     DEFAULT_NUM_EPOCHS,
@@ -25,60 +21,14 @@ from src.config import (
     NUM_WORKERS,
     PIN_MEMORY,
 )
+from src.metadata import get_next_folder, save_training_parameters
+from src.metrics import calculate_metrics
 from src.wandb_utils import (
     cleanup_wandb_run,
     init_wandb_run,
     log_batch,
     log_epoch,
 )
-
-
-def get_next_folder(base_name: str, base_dir: Path = CHECKPOINTS_DIR) -> Path:
-    """
-    Get the next available folder
-    """
-    # Increments Non-Unique Folders
-    pattern = re.compile(rf"{re.escape(base_name)}(\d*)$")
-
-    # Find all existing folders with this base name
-    existing_numbers = []
-    for item in base_dir.iterdir():
-        if item.is_dir():
-            match = pattern.match(item.name)
-            if match:
-                number_str = match.group(1)
-                if number_str:
-                    existing_numbers.append(int(number_str))
-                else:
-                    existing_numbers.append(0)
-
-    # Only add number if it's not the first one
-    if existing_numbers:
-        next_number = max(existing_numbers) + 1
-        if next_number == 1 and 0 in existing_numbers:
-            run_folder = base_dir / f"{base_name}{next_number}"
-        elif next_number > 0:
-            run_folder = base_dir / f"{base_name}{next_number}"
-        else:
-            run_folder = base_dir / f"{base_name}"
-    else:
-        run_folder = base_dir / f"{base_name}"
-
-    run_folder.mkdir(parents=True, exist_ok=True)
-    print(f"Created run folder: {run_folder.name}")
-
-    return run_folder
-
-
-def save_training_parameters(run_folder: Path, parameters: dict) -> None:
-    params_path = run_folder / "training_parameters.json"
-
-    parameters["timestamp"] = datetime.now().isoformat()
-
-    with open(params_path, "w") as f:
-        json.dump(parameters, f, indent=2, default=str)
-
-    print(f"Training parameters saved to: {params_path}")
 
 
 def train_epoch(
@@ -148,13 +98,17 @@ def train_epoch(
         progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
     avg_loss = total_loss / len(dataloader)
-    accuracy = accuracy_score(all_labels, all_preds)
+    metrics = calculate_metrics(all_labels, all_preds, average="weighted")
 
-    precision, recall, f1, support = precision_recall_fscore_support(
-        all_labels, all_preds, average="weighted", zero_division=0
+    return (
+        avg_loss,
+        metrics["accuracy"],
+        metrics["precision"],
+        metrics["recall"],
+        metrics["f1"],
+        all_preds,
+        all_labels,
     )
-
-    return avg_loss, accuracy, precision, recall, f1, all_preds, all_labels
 
 
 def validate(
@@ -206,12 +160,17 @@ def validate(
             progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
     avg_loss = total_loss / len(dataloader)
-    accuracy = accuracy_score(all_labels, all_preds)
-    precision, recall, f1, _ = precision_recall_fscore_support(
-        all_labels, all_preds, average="weighted", zero_division=0
-    )
+    metrics = calculate_metrics(all_labels, all_preds, average="weighted")
 
-    return avg_loss, accuracy, precision, recall, f1, all_preds, all_labels
+    return (
+        avg_loss,
+        metrics["accuracy"],
+        metrics["precision"],
+        metrics["recall"],
+        metrics["f1"],
+        all_preds,
+        all_labels,
+    )
 
 
 def train_model(
@@ -237,6 +196,7 @@ def train_model(
     run_folder : Path
         Path to the run folder
     """
+
     # Create run folder FIRST to get unique name
     run_folder = get_next_folder(f"{model_name}")
     unique_run_name = (
@@ -425,20 +385,18 @@ def train_model(
             # Save Best Model
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
-                torch.save(
-                    {
-                        "epoch": epoch,
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "val_acc": val_acc,
-                        "val_loss": val_loss,
-                        "val_f1": val_f1,
-                        "history": history,
-                    },
-                    save_path,
+                save_checkpoint(
+                    save_path=save_path,
+                    model=model,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    val_acc=val_acc,
+                    val_loss=val_loss,
+                    val_f1=val_f1,
+                    history=history,
                 )
                 print(
-                    f"✓ New best model saved! (Val Acc: {val_acc:.4f}, Val F1: {val_f1:.4f})"
+                    f"New best model saved! (Val Acc: {val_acc:.4f}, Val F1: {val_f1:.4f})"
                 )
 
             # Create backup checkpoint
@@ -487,11 +445,11 @@ def train_model(
 
     # Save History
     save_training_parameters(run_folder, training_parameters)
-    history_path = run_folder / f"history_{unique_run_name}.json"
 
-    with open(history_path, "w") as f:
-        json.dump(history, f, indent=2)
-    print(f"Training history saved to: {history_path}")
+    # Save history using metadata utility
+    from src.metadata import save_training_history
+
+    save_training_history(run_folder, history)
 
     # Create final backup
     final_backup_path = backup_manager.create_backup(
@@ -503,55 +461,22 @@ def train_model(
         val_loss=val_loss,
         is_final=True,
     )
-    print(f"🎯 Final backup created: {final_backup_path}")
-
-    # Debug: check backup state before cleanup
-    backup_manager.debug_backup_state()
+    print(f"Final backup created: {final_backup_path}")
 
     # SUCCESSFUL TRAINING COMPLETION - DELETE ALL BACKUPS
-    print("🗑️  Training completed successfully - cleaning up all backups...")
+    print("Training completed successfully - cleaning up all backups...")
     deleted_count = backup_manager.cleanup_all_backups()
-    print(f"✅ Deleted {deleted_count} backup files")
+    print(f"Deleted {deleted_count} backup files")
 
     # Remove the now-empty backups folder
     folder_deleted = backup_manager.cleanup_backup_folder()
     if folder_deleted:
-        print("✅ Backups folder successfully removed")
+        print("Backups folder successfully removed")
     else:
-        print("⚠️  Backups folder could not be removed")
-
-    # Debug: check backup state after cleanup
-    backup_manager.debug_backup_state()
+        print("Backups folder could not be removed")
 
     # Finish W&B run with cleanup
     if use_wandb:
         cleanup_wandb_run()
 
     return model, history, run_folder
-
-
-def load_checkpoint(
-    model: torch.nn.Module,
-    checkpoint_path: Path,
-    optimizer: torch.optim.Optimizer = None,
-) -> tuple[torch.nn.Module, dict]:
-    """
-    Returns
-    -------
-    model : torch.nn.Module
-        Model with loaded weights
-    checkpoint : dict
-        Full checkpoint dictionary
-    """
-    checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
-    model.load_state_dict(checkpoint["model_state_dict"])
-
-    if optimizer is not None and "optimizer_state_dict" in checkpoint:
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-
-    print(f"Loaded checkpoint from {checkpoint_path}")
-    print(f"Epoch: {checkpoint.get('epoch', 'N/A')}")
-    print(f"Val Acc: {checkpoint.get('val_acc', 'N/A'):.4f}")
-    print(f"Val F1: {checkpoint.get('val_f1', 'N/A'):.4f}")
-
-    return model, checkpoint
