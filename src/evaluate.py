@@ -4,7 +4,6 @@ Evaluation functions for emotion classification models with Weights & Biases.
 
 import numpy as np
 import torch
-import wandb
 from sklearn.metrics import (
     accuracy_score,
     classification_report,
@@ -21,6 +20,7 @@ from .config import (
     NUM_WORKERS,
     PIN_MEMORY,
 )
+from .wandb_utils import get_wandb_mode
 
 
 def evaluate_model(
@@ -32,7 +32,6 @@ def evaluate_model(
     run_name: str = "evaluation",
 ) -> dict[str, np.ndarray]:
     """
-
     Returns
     -------
     metrics :
@@ -121,7 +120,9 @@ def evaluate_model(
     }
 
     # Log to W&B
-    if log_to_wandb:
+    if log_to_wandb and get_wandb_mode() != "disabled":
+        import wandb
+
         # Log overall metrics
         wandb.log(
             {
@@ -129,18 +130,6 @@ def evaluate_model(
                 "test_precision": precision,
                 "test_recall": recall,
                 "test_f1": f1,
-            }
-        )
-
-        # Log confusion matrix
-        wandb.log(
-            {
-                "confusion_matrix": wandb.plot.confusion_matrix(
-                    probs=None,
-                    y_true=all_labels,
-                    preds=all_preds,
-                    class_names=EMOTION_LABELS,
-                )
             }
         )
 
