@@ -5,6 +5,8 @@ WandB utility functions for managing online/offline modes, syncing, and logging.
 import os
 import shutil
 import subprocess
+import time
+from functools import wraps
 from pathlib import Path
 from typing import Any, Literal
 
@@ -43,6 +45,32 @@ def login(
     return check_wandb_mode()
 
 
+def retry_on_connection_error(max_retries=3, delay=2):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except (ConnectionResetError, ConnectionError, OSError) as e:
+                    if attempt < max_retries - 1:
+                        print(
+                            f"  WandB connection error (attempt {attempt + 1}/{max_retries}), retrying in {delay}s..."
+                        )
+                        time.sleep(delay)
+                    else:
+                        print(
+                            f" WandB connection failed after {max_retries} attempts: {e}"
+                        )
+                        # Don't raise - just continue without logging
+                        return None
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
 def init_wandb_run(
     project: str = "emotion-classification",
     name: str | None = None,
@@ -53,65 +81,116 @@ def init_wandb_run(
         print("WandB is disabled")
         return None
 
-    run = wandb.init(project=project, name=name, config=config)
+    try:
+        run = wandb.init(
+            project=project,
+            name=name,
+            config=config,
+            reinit=True,  # Allow multiple runs in same process
+            settings=wandb.Settings(
+                start_method="thread",  # Better for notebooks
+                _disable_stats=True,  # Reduce system monitoring overhead
+                _disable_meta=True,  # Reduce metadata collection
+            ),
+        )
 
-    if model is not None:
-        wandb.watch(model, log="all", log_freq=100)
+        if model is not None:
+            # Reduced log frequency from 100 to 500
+            wandb.watch(model, log="all", log_freq=500)
 
-    print(f"WandB run started: {run.name}")
-    if run.url:
-        print(f"WandB Dashboard: {run.url}")
+        print(f"WandB run started: {run.name}")
+        if run.url:
+            print(f"WandB Dashboard: {run.url}")
 
-    return run
+        return run
+    except Exception as e:
+        print(f"⚠️  Failed to initialize WandB run: {e}")
+        return None
 
 
+@retry_on_connection_error()
 def log_batch(loss: float, learning_rate: float, epoch: int, batch_idx: int):
+    """Log batch-level training metrics (loss only)"""
     if get_wandb_mode() == "disabled" or wandb.run is None:
         return
 
     wandb.log(
         {
-            "batch_train_loss": loss,
-            "learning_rate": learning_rate,
+            "train/batch_loss": loss,
+            "train/learning_rate": learning_rate,
             "epoch": epoch,
             "batch": batch_idx,
         }
     )
 
 
+@retry_on_connection_error()
 def log_epoch(
     epoch: int,
     train_loss: float,
-    train_accuracy: float,
-    train_precision: float,
-    train_recall: float,
-    train_f1: float,
     val_loss: float,
     val_accuracy: float,
-    val_precision: float,
-    val_recall: float,
     val_f1: float,
-    learning_rate: float,
+    val_precision: float | None = None,
+    val_recall: float | None = None,
+    learning_rate: float | None = None,
 ):
+    """
+    Log epoch-level metrics.
+
+    Training: Only loss (optimization metric)
+    Validation: Loss, Accuracy, F1, and optionally Precision/Recall
+    """
     if get_wandb_mode() == "disabled" or wandb.run is None:
         return
 
-    wandb.log(
-        {
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "train_accuracy": train_accuracy,
-            "train_precision": train_precision,
-            "train_recall": train_recall,
-            "train_f1": train_f1,
-            "val_loss": val_loss,
-            "val_accuracy": val_accuracy,
-            "val_precision": val_precision,
-            "val_recall": val_recall,
-            "val_f1": val_f1,
-            "learning_rate": learning_rate,
-        }
-    )
+    log_dict = {
+        "epoch": epoch,
+        "train/loss": train_loss,
+        "val/loss": val_loss,
+        "val/accuracy": val_accuracy,
+        "val/f1": val_f1,
+    }
+
+    # Optional metrics
+    if val_precision is not None:
+        log_dict["val/precision"] = val_precision
+    if val_recall is not None:
+        log_dict["val/recall"] = val_recall
+    if learning_rate is not None:
+        log_dict["train/learning_rate"] = learning_rate
+
+    wandb.log(log_dict)
+
+
+def finish_wandb_run(quiet: bool = False):
+    if wandb.run is not None:
+        try:
+            wandb.finish(quiet=quiet)
+            if not quiet:
+                print("✅ WandB run finished successfully")
+        except Exception as e:
+            if not quiet:
+                print(f"⚠️  Error finishing WandB run: {e}")
+    else:
+        if not quiet:
+            print("No active WandB run to finish")
+
+
+# In an attempt to resolve the Connectione Timeout Errors
+def cleanup_wandb_run():
+    try:
+        if wandb.run is not None:
+            wandb.finish(quiet=True)
+
+        # Small delay to ensure cleanup completes
+        time.sleep(0.5)
+
+        print("WandB run cleaned up")
+        return True
+    except Exception as e:
+        print(f"Error during WandB cleanup: {e}")
+        return False
 
 
 def sync_offline_runs():
@@ -210,19 +289,6 @@ def clear_offline_runs(confirm: bool = False) -> int:
 
 
 def get_folder_size_mb(folder_path: Path) -> float:
-    """
-    Calculate the size of a folder in MB.
-
-    Parameters
-    ----------
-    folder_path : Path
-        Path to the folder
-
-    Returns
-    -------
-    float
-        Size in megabytes
-    """
     try:
         total_size = 0
         for file_path in folder_path.rglob("*"):

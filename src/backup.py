@@ -81,26 +81,89 @@ class BackupManager:
 
         return backup_path
 
-    def cleanup_old_backups(self):
+    def cleanup_old_backups(self) -> int:
         """
         Remove old backups beyond the maximum allowed.
         Keeps the most recent backups.
         """
-        backup_files = list(self.backups_dir.glob("backup_*.pth"))
+        try:
+            backup_files = list(self.backups_dir.glob("backup_*.pth"))
 
-        if len(backup_files) <= self.max_backups:
-            return
+            if len(backup_files) <= self.max_backups:
+                return 0
 
-        # Sort by time
-        backup_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-        backups_to_delete = backup_files[self.max_backups :]
+            # Sort by time
+            backup_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
 
-        for backup_path in backups_to_delete:
-            backup_path.unlink(missing_ok=True)
-            info_path = backup_path.with_suffix(".json")
-            info_path.unlink(missing_ok=True)
+            backups_to_keep = backup_files[: self.max_backups]
+            backups_to_delete = backup_files[self.max_backups :]
 
-            print(f"Deleted old backup: {backup_path.name}")
+            deleted_count = 0
+            for backup_path in backups_to_delete:
+                # Delete both .pth and .json files
+                if backup_path.exists():
+                    backup_path.unlink(missing_ok=True)
+
+                info_path = backup_path.with_suffix(".json")
+                if info_path.exists():
+                    info_path.unlink(missing_ok=True)
+
+                print(f"Deleted old backup: {backup_path.name}")
+                deleted_count += 1
+
+            return deleted_count
+
+        except Exception as e:
+            print(f"Error during backup cleanup: {e}")
+            return 0
+
+    def cleanup_backup_folder(self) -> bool:
+        """
+        Remove the entire backups folder if it's empty after cleanup.
+        """
+        try:
+            # Check if backups directory exists and is empty
+            if self.backups_dir.exists():
+                # List all files in backups directory
+                remaining_files = list(self.backups_dir.glob("*"))
+                if not remaining_files:
+                    self.backups_dir.rmdir()
+                    print(f"  Removed empty backups directory: {self.backups_dir}")
+                    return True
+                else:
+                    print(
+                        f" Backups directory not empty ({len(remaining_files)} files remain): {self.backups_dir}"
+                    )
+                    return False
+            return False
+        except Exception as e:
+            print(f"Could not remove backups directory: {e}")
+            return False
+
+    def cleanup_all_backups(self) -> int:
+        """
+        Remove ALL backup files after successful training.
+        """
+        try:
+            deleted_count = 0
+
+            # Delete all .pth backup files
+            for pth_file in self.backups_dir.glob("backup_*.pth"):
+                pth_file.unlink(missing_ok=True)
+
+                # Also delete corresponding .json file
+                json_file = pth_file.with_suffix(".json")
+                json_file.unlink(missing_ok=True)
+
+                deleted_count += 1
+                print(f"🧹 Deleted backup: {pth_file.name}")
+
+            print(f"Deleted all {deleted_count} backup files after successful training")
+            return deleted_count
+
+        except Exception as e:
+            print(f"Error during full backup cleanup: {e}")
+            return 0
 
     def list_backups(self) -> list[dict[str, Any]]:
         backups = []

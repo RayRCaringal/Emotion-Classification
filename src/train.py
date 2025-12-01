@@ -26,6 +26,7 @@ from src.config import (
     PIN_MEMORY,
 )
 from src.wandb_utils import (
+    cleanup_wandb_run,
     init_wandb_run,
     log_batch,
     log_epoch,
@@ -135,7 +136,8 @@ def train_epoch(
         all_preds.extend(preds.cpu().numpy())
         all_labels.extend(labels.cpu().numpy())
 
-        if batch_idx % 50 == 0:
+        # REDUCED LOGGING FREQUENCY from 50 to 200
+        if batch_idx % 200 == 0:
             log_batch(
                 loss=loss.item(),
                 learning_rate=lr_scheduler.get_last_lr()[0],
@@ -235,7 +237,11 @@ def train_model(
     run_folder : Path
         Path to the run folder
     """
+    # Create run folder FIRST to get unique name
     run_folder = get_next_folder(f"{model_name}")
+    unique_run_name = (
+        run_folder.name
+    )  # This is the unique folder name (e.g., baseline_none1)
 
     training_parameters = {
         "model_name": model_name,
@@ -253,7 +259,7 @@ def train_model(
             "weight_decay": optimizer.param_groups[0].get("weight_decay", 0),
             "betas": optimizer.param_groups[0].get("betas", (0.9, 0.999)),
         },
-        "run_folder": run_folder.name,
+        "run_folder": unique_run_name,
         "train_dataset_size": len(train_dataset),
         "val_dataset_size": len(val_dataset),
     }
@@ -266,12 +272,16 @@ def train_model(
                 "epochs": num_epochs,
                 "model_name": model_name,
                 "architecture": type(model).__name__,
-                "run_folder": run_folder.name,
+                "run_folder": unique_run_name,
             }
+        else:
+            # Ensure run_folder is in the config with the unique name
+            wandb_config["run_folder"] = unique_run_name
 
+        # Use the unique run folder name for WandB
         init_wandb_run(
             project="emotion-classification",
-            name=f"{model_name}_{run_folder.name}",
+            name=unique_run_name,  # Use unique folder name
             config=wandb_config,
             model=model,
         )
@@ -338,6 +348,7 @@ def train_model(
     )
 
     print(f"Training {model_name} for {num_epochs} epochs...")
+    print(f"Run name (WandB): {unique_run_name}")
     print(f"Total training steps: {num_training_steps}")
     print(f"Device: {device}")
     print(f"Batch size: {batch_size}")
@@ -352,89 +363,117 @@ def train_model(
     print("=" * 70)
 
     # Training loop
-    for epoch in range(num_epochs):
-        print(f"\nEpoch {epoch + 1}/{num_epochs}")
-        print("-" * 70)
+    try:
+        for epoch in range(num_epochs):
+            print(f"\nEpoch {epoch + 1}/{num_epochs}")
+            print("-" * 70)
 
-        # Train
-        (
-            train_loss,
-            train_acc,
-            train_precision,
-            train_recall,
-            train_f1,
-            train_preds,
-            train_labels,
-        ) = train_epoch(model, train_loader, optimizer, lr_scheduler, device, epoch)
+            # Train
+            (
+                train_loss,
+                train_acc,
+                train_precision,
+                train_recall,
+                train_f1,
+                train_preds,
+                train_labels,
+            ) = train_epoch(model, train_loader, optimizer, lr_scheduler, device, epoch)
 
-        # Validate
-        val_loss, val_acc, val_precision, val_recall, val_f1, val_preds, val_labels = (
-            validate(model, val_loader, device, epoch)
+            # Validate
+            (
+                val_loss,
+                val_acc,
+                val_precision,
+                val_recall,
+                val_f1,
+                val_preds,
+                val_labels,
+            ) = validate(model, val_loader, device, epoch)
+
+            # Save history (keep all metrics locally for analysis)
+            history["train_loss"].append(train_loss)
+            history["train_acc"].append(train_acc)
+            history["train_precision"].append(train_precision)
+            history["train_recall"].append(train_recall)
+            history["train_f1"].append(train_f1)
+            history["val_loss"].append(val_loss)
+            history["val_acc"].append(val_acc)
+            history["val_precision"].append(val_precision)
+            history["val_recall"].append(val_recall)
+            history["val_f1"].append(val_f1)
+
+            # Log to WandB (reduced metrics)
+            if use_wandb:
+                log_epoch(
+                    epoch=epoch,
+                    train_loss=train_loss,
+                    val_loss=val_loss,
+                    val_accuracy=val_acc,
+                    val_f1=val_f1,
+                    val_precision=val_precision,  # Optional
+                    val_recall=val_recall,  # Optional
+                    learning_rate=lr_scheduler.get_last_lr()[0],
+                )
+
+            print(
+                f"\nTrain Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Train F1: {train_f1:.4f}"
+            )
+            print(
+                f"Val Loss:   {val_loss:.4f} | Val Acc:   {val_acc:.4f} | Val F1:   {val_f1:.4f}"
+            )
+
+            # Save Best Model
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "val_acc": val_acc,
+                        "val_loss": val_loss,
+                        "val_f1": val_f1,
+                        "history": history,
+                    },
+                    save_path,
+                )
+                print(
+                    f"✓ New best model saved! (Val Acc: {val_acc:.4f}, Val F1: {val_f1:.4f})"
+                )
+
+            # Create backup checkpoint
+            if backup_manager.should_backup(epoch):
+                backup_path = backup_manager.create_backup(
+                    model=model,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    history=history,
+                    val_acc=val_acc,
+                    val_loss=val_loss,
+                )
+                print(f"Backup created: {backup_path}")
+
+    except Exception as e:
+        print(f"\n Training interrupted with error: {e}")
+        print("Saving current state before exit...")
+
+        # Save emergency checkpoint
+        emergency_path = run_folder / f"emergency_checkpoint_{unique_run_name}.pth"
+        torch.save(
+            {
+                "epoch": epoch if "epoch" in locals() else 0,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "history": history,
+            },
+            emergency_path,
         )
-
-        # Save history
-        history["train_loss"].append(train_loss)
-        history["train_acc"].append(train_acc)
-        history["train_precision"].append(train_precision)
-        history["train_recall"].append(train_recall)
-        history["train_f1"].append(train_f1)
-        history["val_loss"].append(val_loss)
-        history["val_acc"].append(val_acc)
-        history["val_precision"].append(val_precision)
-        history["val_recall"].append(val_recall)
-        history["val_f1"].append(val_f1)
+        print(f"Emergency checkpoint saved to: {emergency_path}")
 
         if use_wandb:
-            log_epoch(
-                epoch=epoch,
-                train_loss=train_loss,
-                train_accuracy=train_acc,
-                train_precision=train_precision,
-                train_recall=train_recall,
-                train_f1=train_f1,
-                val_loss=val_loss,
-                val_accuracy=val_acc,
-                val_precision=val_precision,
-                val_recall=val_recall,
-                val_f1=val_f1,
-                learning_rate=lr_scheduler.get_last_lr()[0],
-            )
+            cleanup_wandb_run()
 
-        print(
-            f"\nTrain Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Train F1: {train_f1:.4f}"
-        )
-        print(
-            f"Val Loss:   {val_loss:.4f} | Val Acc:   {val_acc:.4f} | Val F1:   {val_f1:.4f}"
-        )
-
-        # Save Best Model
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "val_acc": val_acc,
-                    "val_loss": val_loss,
-                    "val_f1": val_f1,
-                    "history": history,
-                },
-                save_path,
-            )
-            print(f"New Best Model: (Val Acc: {val_acc:.4f}, Val F1: {val_f1:.4f})")
-
-        # Create backup checkpoint
-        if backup_manager.should_backup(epoch):
-            backup_path = backup_manager.create_backup(
-                model=model,
-                optimizer=optimizer,
-                epoch=epoch,
-                history=history,
-                val_acc=val_acc,
-                val_loss=val_loss,
-            )
-            print(f"Backup created: {backup_path}")
+        raise
 
     print("\n" + "=" * 70)
     print("Training completed!")
@@ -448,7 +487,7 @@ def train_model(
 
     # Save History
     save_training_parameters(run_folder, training_parameters)
-    history_path = run_folder / f"history_{model_name}.json"
+    history_path = run_folder / f"history_{unique_run_name}.json"
 
     with open(history_path, "w") as f:
         json.dump(history, f, indent=2)
@@ -466,19 +505,27 @@ def train_model(
     )
     print(f"🎯 Final backup created: {final_backup_path}")
 
-    print("Cleaning up all backups...")
+    # Debug: check backup state before cleanup
+    backup_manager.debug_backup_state()
+
+    # SUCCESSFUL TRAINING COMPLETION - DELETE ALL BACKUPS
+    print("🗑️  Training completed successfully - cleaning up all backups...")
     deleted_count = backup_manager.cleanup_all_backups()
     print(f"✅ Deleted {deleted_count} backup files")
 
+    # Remove the now-empty backups folder
     folder_deleted = backup_manager.cleanup_backup_folder()
     if folder_deleted:
-        print("Backups folder successfully removed")
+        print("✅ Backups folder successfully removed")
     else:
-        print("Backups folder could not be removed")
+        print("⚠️  Backups folder could not be removed")
 
-    # Finish W&B run
+    # Debug: check backup state after cleanup
+    backup_manager.debug_backup_state()
+
+    # Finish W&B run with cleanup
     if use_wandb:
-        wandb.finish()
+        cleanup_wandb_run()
 
     return model, history, run_folder
 
