@@ -2,6 +2,9 @@
 LoRA (Low-Rank Adaptation) training functions for Vision Transformer fine-tuning.
 """
 
+import gc
+from pathlib import Path
+
 import torch
 from peft import LoraConfig, PeftModel, get_peft_model
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
@@ -48,51 +51,109 @@ def get_lora_model(
 ):
     """
     Apply LoRA configuration to base model and optionally unfreeze classifier head.
-
-    Args:
-        base_model: The base model to apply LoRA to
-        lora_config: LoRA configuration
-        unfreeze_classifier: Whether to unfreeze the classifier head for training
     """
     model = get_peft_model(base_model, lora_config)
 
     if unfreeze_classifier:
         # Unfreeze the classifier head for training
-        # Note: Different ViT models might have different classifier attribute names
-        classifier_attr = None
+        classifier_names = ["classifier", "classifier_head", "head", "fc"]
 
-        # Try to find the classifier attribute
-        possible_names = ["classifier", "classifier_head", "head", "fc"]
-        for name in possible_names:
-            if hasattr(model.base_model, name):
-                classifier_attr = name
-                break
-            elif hasattr(model.base_model.model, name):
-                classifier_attr = "model." + name
-                break
+        for name in classifier_names:
+            try:
+                # Try different possible locations for classifier
+                if hasattr(model, name):
+                    classifier = getattr(model, name)
+                elif hasattr(model.base_model, name):
+                    classifier = getattr(model.base_model, name)
+                elif hasattr(model.base_model.model, name):
+                    classifier = getattr(model.base_model.model, name)
+                else:
+                    continue
 
-        if classifier_attr:
-            # Handle nested attribute access
-            if "." in classifier_attr:
-                parent, child = classifier_attr.split(".")
-                parent_obj = getattr(model.base_model, parent)
-                classifier = getattr(parent_obj, child)
-            else:
-                classifier = getattr(model.base_model, classifier_attr)
+                if hasattr(classifier, "parameters"):
+                    for param in classifier.parameters():
+                        param.requires_grad = True
+                    print(f"✅ Classifier head '{name}' unfrozen for training")
+                    break
+            except AttributeError:
+                continue
 
-            for param in classifier.parameters():
-                param.requires_grad = True
-
-            print(f"✅ Classifier head '{classifier_attr}' unfrozen for training")
-        else:
-            # Fallback: try to find classifier in named_parameters
+        # If no classifier found, warn but continue
+        if not any(param.requires_grad for param in model.parameters()):
+            print(
+                "⚠️ Warning: No parameters require gradient. Checking all parameters..."
+            )
             for name, param in model.named_parameters():
-                if "classifier" in name.lower() or "head" in name.lower():
+                if "classifier" in name or "head" in name or "fc" in name:
                     param.requires_grad = True
-                    print(f"✅ Unfroze parameter: {name}")
+                    print(f"   Unfroze: {name}")
 
     model.print_trainable_parameters()
     return model
+
+
+def safe_save_checkpoint(state_dict, filepath, metadata=None):
+    """Safely save checkpoint with proper error handling."""
+    try:
+        # Create directory if it doesn't exist
+        filepath = Path(filepath)
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+
+        # Use torch.save with _use_new_zipfile_serialization for better compatibility
+        torch.save(state_dict, filepath, _use_new_zipfile_serialization=True)
+
+        # Verify the file was written
+        if filepath.exists():
+            file_size = filepath.stat().st_size
+            print(f"✅ Checkpoint saved: {filepath} ({file_size:,} bytes)")
+            return True
+        else:
+            print(f"❌ Failed to save checkpoint: {filepath}")
+            return False
+
+    except Exception as e:
+        print(f"❌ Error saving checkpoint {filepath}: {e}")
+        return False
+
+
+def safe_load_checkpoint(filepath, device="cpu", weights_only=False):
+    """Safely load checkpoint with proper error handling."""
+    try:
+        filepath = Path(filepath)
+        if not filepath.exists():
+            print(f"❌ Checkpoint not found: {filepath}")
+            return None
+
+        file_size = filepath.stat().st_size
+        print(f"📁 Loading checkpoint: {filepath} ({file_size:,} bytes)")
+
+        # Try loading with weights_only flag for safety
+        checkpoint = torch.load(
+            filepath, map_location=device, weights_only=weights_only
+        )
+
+        if checkpoint is not None:
+            print("✅ Checkpoint loaded successfully")
+        else:
+            print("❌ Checkpoint loaded but is None")
+
+        return checkpoint
+
+    except Exception as e:
+        print(f"❌ Error loading checkpoint {filepath}: {e}")
+
+        # Try alternative loading methods
+        try:
+            print("🔄 Trying alternative loading method...")
+            import pickle
+
+            with open(filepath, "rb") as f:
+                checkpoint = pickle.load(f)
+            print("✅ Loaded with pickle")
+            return checkpoint
+        except:
+            print("❌ All loading methods failed")
+            return None
 
 
 def train_epoch(
@@ -119,26 +180,30 @@ def train_epoch(
 
         # Check if loss requires grad
         if not loss.requires_grad:
-            print(
-                f"⚠️ WARNING: Loss doesn't require gradient at epoch {epoch}, batch {batch_idx}"
-            )
-            print("This might indicate that no parameters require gradients.")
-
-            # Debug: Check which parameters require grad
-            trainable_params = [
-                (name, p.requires_grad)
-                for name, p in model.named_parameters()
-                if p.requires_grad
-            ]
-            if not trainable_params:
-                print("❌ CRITICAL: No parameters require gradients!")
-            else:
-                print(
-                    f"✅ Found {len(trainable_params)} parameters with gradients enabled"
-                )
+            if batch_idx == 0:  # Only warn on first batch to avoid spam
+                print(f"⚠️ WARNING: Loss doesn't require gradient at epoch {epoch}")
+                trainable_params = [
+                    (name, p.requires_grad)
+                    for name, p in model.named_parameters()
+                    if p.requires_grad
+                ]
+                if not trainable_params:
+                    print("❌ CRITICAL: No parameters require gradients!")
+                    # Try emergency fix
+                    for name, param in model.named_parameters():
+                        if "lora" in name.lower():
+                            param.requires_grad = True
+                    print("   Emergency: Set all LoRA parameters to require_grad=True")
+                else:
+                    print(
+                        f"✅ Found {len(trainable_params)} parameters with gradients enabled"
+                    )
 
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(), max_norm=1.0
+        )  # Gradient clipping
         optimizer.step()
         lr_scheduler.step()
 
@@ -148,6 +213,10 @@ def train_epoch(
         all_labels.extend(labels.cpu().numpy())
 
         progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+        # Clear cache periodically to prevent memory buildup
+        if batch_idx % 50 == 0 and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     avg_loss = total_loss / len(dataloader)
     accuracy = accuracy_score(all_labels, all_preds)
@@ -189,85 +258,86 @@ def validate(model, dataloader: DataLoader, device: torch.device, epoch: int):
 
 
 def save_lora_model_for_inference(
-    model: PeftModel,
-    run_folder,
-    model_name: str = "lora_model",
-    save_classifier_separately: bool = True,
+    model: PeftModel, run_folder, model_name: str = "lora_model"
 ):
     """
-    Save LoRA model for inference with options to save classifier weights separately.
-
-    Args:
-        model: The trained LoRA model
-        run_folder: Folder to save the model
-        model_name: Base name for the model files
-        save_classifier_separately: Whether to save classifier weights separately for reloading
+    Save LoRA model for inference with robust error handling.
     """
     print("\nSaving model for inference...")
+
+    # Clean up memory before saving
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     lora_save_path = run_folder / "lora_adapter"
     best_model_path = run_folder / f"best_{model_name}.pth"
 
-    # Save LoRA adapters
-    model.save_pretrained(lora_save_path)
-    print(f"LoRA adapters saved to: {lora_save_path}")
-
-    # Save full model checkpoint with classifier weights
-    # Extract classifier weights if they exist
-    classifier_state = {}
-    for name, param in model.named_parameters():
-        if "classifier" in name or "head" in name:
-            classifier_state[name] = param.data.clone()
-
-    # Get base model info
-    base_model_name = (
-        model.base_model.config._name_or_path
-        if hasattr(model.base_model.config, "_name_or_path")
-        else "google/vit-base-patch16-224-in21k"
-    )
-    num_labels = (
-        model.base_model.config.num_labels
-        if hasattr(model.base_model.config, "num_labels")
-        else 7
-    )
-
-    # Save checkpoint
-    checkpoint = {
-        "model_state_dict": model.state_dict(),
-        "lora_config": model.peft_config["default"].to_dict()
-        if hasattr(model, "peft_config")
-        else {},
-        "base_model_name": base_model_name,
-        "num_labels": num_labels,
-    }
-
-    # Add classifier weights if found
-    if classifier_state:
-        checkpoint["classifier_state"] = classifier_state
-        print(f"Saved classifier weights for {len(classifier_state)} parameters")
-
-    torch.save(checkpoint, best_model_path)
-    print(f"Full model checkpoint saved to: {best_model_path}")
-
-    # Optionally save merged model
     try:
+        # Save LoRA adapters
+        model.save_pretrained(lora_save_path)
+        print(f"✅ LoRA adapters saved to: {lora_save_path}")
+    except Exception as e:
+        print(f"❌ Failed to save LoRA adapters: {e}")
+        lora_save_path = None
+
+    try:
+        # Save full model checkpoint
+        base_model_name = getattr(
+            model.base_model.config,
+            "_name_or_path",
+            "google/vit-base-patch16-224-in21k",
+        )
+        num_labels = getattr(model.base_model.config, "num_labels", 7)
+
+        # Get LoRA config safely
+        lora_config_dict = {}
+        if hasattr(model, "peft_config") and "default" in model.peft_config:
+            lora_config_dict = model.peft_config["default"].to_dict()
+
+        # Prepare checkpoint data
+        checkpoint_data = {
+            "model_state_dict": model.state_dict(),
+            "lora_config": lora_config_dict,
+            "base_model_name": base_model_name,
+            "num_labels": num_labels,
+        }
+
+        # Save checkpoint
+        success = safe_save_checkpoint(checkpoint_data, best_model_path)
+        if success:
+            print(f"✅ Full model checkpoint saved to: {best_model_path}")
+        else:
+            print(f"❌ Failed to save checkpoint: {best_model_path}")
+            best_model_path = None
+
+    except Exception as e:
+        print(f"❌ Failed to save checkpoint: {e}")
+        best_model_path = None
+
+    merged_save_path = None
+    try:
+        # Try to save merged model
+        print("Merging and saving model...")
         merged_model = model.merge_and_unload()
         merged_save_path = run_folder / "merged_model"
         merged_model.save_pretrained(merged_save_path)
-        print(f"Merged model saved to: {merged_save_path}")
-        return {
-            "lora_adapters": lora_save_path,
-            "full_checkpoint": best_model_path,
-            "merged_model": merged_save_path,
-        }
+        print(f"✅ Merged model saved to: {merged_save_path}")
+
+        # Clear merged model from memory
+        del merged_model
+        gc.collect()
+
     except Exception as e:
         print(f"⚠️ Could not save merged model: {e}")
-        print("Saving only LoRA adapters and checkpoint")
-        return {
-            "lora_adapters": lora_save_path,
-            "full_checkpoint": best_model_path,
-            "merged_model": None,
-        }
+        print("   This is not critical - you can still use LoRA adapters")
+        merged_save_path = None
+
+    return {
+        "lora_adapters": lora_save_path,
+        "full_checkpoint": best_model_path,
+        "merged_model": merged_save_path,
+    }
 
 
 def train_lora_model(
@@ -281,13 +351,14 @@ def train_lora_model(
     model_name: str = "lora_model",
     use_wandb: bool = True,
     wandb_config: dict | None = None,
+    gradient_accumulation_steps: int = 1,  # Add gradient accumulation
 ):
     from src.wandb_utils import cleanup_wandb_run, init_wandb_run, log_epoch
 
     run_folder = get_next_folder(f"{model_name}")
     unique_run_name = run_folder.name
 
-    # Count trainable parameters BEFORE moving to device
+    # Count trainable parameters
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
 
@@ -296,6 +367,7 @@ def train_lora_model(
         "model_type": "LoRA",
         "num_epochs": num_epochs,
         "batch_size": batch_size,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
         "learning_rate": DEFAULT_LEARNING_RATE,
         "warmup_steps": DEFAULT_WARMUP_STEPS,
         "device": str(device),
@@ -343,16 +415,18 @@ def train_lora_model(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=NUM_WORKERS,
+        num_workers=min(NUM_WORKERS, 4),  # Limit workers to prevent memory issues
         pin_memory=PIN_MEMORY,
+        persistent_workers=False,  # Disable persistent workers
     )
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=NUM_WORKERS,
+        num_workers=min(NUM_WORKERS, 4),
         pin_memory=PIN_MEMORY,
+        persistent_workers=False,
     )
 
     num_training_steps = num_epochs * len(train_loader)
@@ -363,7 +437,7 @@ def train_lora_model(
         num_training_steps=num_training_steps,
     )
 
-    # Move model to device AFTER creating loaders
+    # Move model to device
     model.to(device)
 
     history = {
@@ -396,16 +470,17 @@ def train_lora_model(
         f"Trainable parameters: {trainable_params:,} ({(trainable_params / total_params) * 100:.2f}%)"
     )
     print(f"Run folder: {run_folder}")
-
-    # Debug: Print trainable parameter names
-    print("\nTrainable parameters:")
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            print(f"  {name}")
+    print(f"Device: {device}")
+    print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
 
     try:
         for epoch in range(num_epochs):
             print(f"\nEpoch {epoch + 1}/{num_epochs}")
+
+            # Clear cache at start of each epoch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                gc.collect()
 
             train_loss, train_acc, train_precision, train_recall, train_f1 = (
                 train_epoch(model, train_loader, optimizer, lr_scheduler, device, epoch)
@@ -444,25 +519,35 @@ def train_lora_model(
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
 
+                # Clear memory before saving
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    gc.collect()
+
                 save_paths = save_lora_model_for_inference(
                     model=model, run_folder=run_folder, model_name=model_name
                 )
 
-                torch.save(
-                    {
-                        "epoch": epoch,
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "val_acc": val_acc,
-                        "val_loss": val_loss,
-                        "val_f1": val_f1,
-                        "history": history,
-                    },
-                    best_model_path,
-                )
-                print(f"Model saved (Val Acc: {val_acc:.4f})")
+                # Save training checkpoint
+                checkpoint_data = {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "val_acc": val_acc,
+                    "val_loss": val_loss,
+                    "val_f1": val_f1,
+                    "history": history,
+                    "training_parameters": training_parameters,
+                }
+
+                success = safe_save_checkpoint(checkpoint_data, best_model_path)
+                if success:
+                    print(f"✅ Training checkpoint saved (Val Acc: {val_acc:.4f})")
+                else:
+                    print("❌ Failed to save training checkpoint")
 
             if backup_manager.should_backup(epoch):
+                print("Creating backup...")
                 backup_path = backup_manager.create_backup(
                     model=model,
                     optimizer=optimizer,
@@ -471,50 +556,71 @@ def train_lora_model(
                     val_acc=val_acc,
                     val_loss=val_loss,
                 )
-                print(f"Backup created: {backup_path}")
+                if backup_path:
+                    print(f"✅ Backup created: {backup_path}")
+
+            # Clear memory between epochs
+            gc.collect()
+
+    except KeyboardInterrupt:
+        print(
+            f"\n⚠️ Training interrupted by user at epoch {epoch if 'epoch' in locals() else 'unknown'}"
+        )
+        # Don't re-raise, just save emergency checkpoint
 
     except Exception as e:
-        print(f"\nTraining interrupted with error: {e}")
-        print("Saving current state before exit...")
+        print(f"\n❌ Training interrupted with error: {e}")
+        print("Saving emergency checkpoint...")
 
+    finally:
+        # Always save emergency checkpoint
         emergency_path = run_folder / f"emergency_checkpoint_{unique_run_name}.pth"
-        torch.save(
-            {
+        try:
+            emergency_data = {
                 "epoch": epoch if "epoch" in locals() else 0,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "history": history,
-            },
-            emergency_path,
-        )
-        print(f"Emergency checkpoint saved to: {emergency_path}")
+                "training_parameters": training_parameters,
+            }
+            success = safe_save_checkpoint(emergency_data, emergency_path)
+            if success:
+                print(f"✅ Emergency checkpoint saved to: {emergency_path}")
+            else:
+                print("❌ Failed to save emergency checkpoint")
+        except Exception as save_error:
+            print(f"❌ Failed to save emergency checkpoint: {save_error}")
 
         if use_wandb:
             cleanup_wandb_run()
-
-        raise
 
     print("\nTraining completed!")
     print(f"Best validation accuracy: {best_val_acc:.4f}")
 
     training_parameters["final_metrics"] = {
         "best_val_accuracy": best_val_acc,
-        "final_val_f1": history["val_f1"][-1],
-        "final_train_accuracy": history["train_acc"][-1],
+        "final_val_f1": history["val_f1"][-1] if history["val_f1"] else 0,
+        "final_train_accuracy": history["train_acc"][-1] if history["train_acc"] else 0,
     }
 
     save_training_parameters(run_folder, training_parameters)
 
+    # Clear memory before final backup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     final_backup_path = backup_manager.create_backup(
         model=model,
         optimizer=optimizer,
-        epoch=num_epochs - 1,
+        epoch=num_epochs - 1 if "epoch" not in locals() else epoch,
         history=history,
-        val_acc=val_acc,
-        val_loss=val_loss,
+        val_acc=val_acc if "val_acc" in locals() else 0,
+        val_loss=val_loss if "val_loss" in locals() else 0,
         is_final=True,
     )
-    print(f"Final backup created: {final_backup_path}")
+    if final_backup_path:
+        print(f"✅ Final backup created: {final_backup_path}")
 
     if use_wandb:
         cleanup_wandb_run()
