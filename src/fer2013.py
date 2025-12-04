@@ -46,9 +46,15 @@ class FER2013Dataset(Dataset):
 
         img = item["image"]
         if isinstance(img, Image.Image):
-            img = np.array(img)
+            img = np.array(img)  # Keep as grayscale
         else:
-            img = np.array(img.convert("RGB"))
+            # Convert to numpy without changing to RGB
+            img = np.array(img)  # Remove .convert("RGB")
+
+        # Ensure 2D grayscale image
+        if len(img.shape) == 3 and img.shape[2] == 3:  # If somehow RGB
+            # Convert RGB to grayscale using luminance formula
+            img = 0.299 * img[:, :, 0] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 2]
 
         # Apply transforms
         if self.transform:

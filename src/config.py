@@ -24,6 +24,13 @@ DEFAULT_NUM_EPOCHS = 5
 DEFAULT_LEARNING_RATE = 2e-5
 DEFAULT_WARMUP_STEPS = 500
 
+# LoRA Hyperparameters
+DEFAULT_LORA_R = 8
+DEFAULT_LORA_ALPHA = 16
+DEFAULT_LORA_DROPOUT = 0.1
+DEFAULT_LORA_TARGET_MODULES = ["query", "value"]
+DEFAULT_LORA_LEARNING_RATE = 2e-4
+
 # Device Configuration
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
