@@ -14,6 +14,8 @@ from torch.utils.data import Dataset
 class FER2013Dataset(Dataset):
     """
     FER2013 Dataset for emotion classification.
+
+    Dataset Images are Single Channel Grayscale so we Conver them to 3 Channel RGB for ViT. Needs to be changed potentially if planning ot use with other models
     """
 
     def __init__(self, split: str = "train", transform: A.Compose | None = None):
@@ -34,34 +36,25 @@ class FER2013Dataset(Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx: int) -> tuple[Any, int]:
-        """
-        Returns
-        -------
-        Tuple[Any, int]
-            Tuple containing:
-            - image: image tensor
-            - label: Emotion label (0-6)
-        """
         item = self.dataset[idx]
 
         img = item["image"]
-        if isinstance(img, Image.Image):
-            img = np.array(img)  # Keep as grayscale
-        else:
-            # Convert to numpy without changing to RGB
-            img = np.array(img)  # Remove .convert("RGB")
+        label = item["label"]
 
-        # Ensure 2D grayscale image
-        if len(img.shape) == 3 and img.shape[2] == 3:  # If somehow RGB
-            # Convert RGB to grayscale using luminance formula
-            img = 0.299 * img[:, :, 0] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 2]
+        if isinstance(img, Image.Image):
+            img_array = np.array(img)
+        else:
+            img_array = np.array(img)
+
+        # If grayscale, convert to 3 channels for ViT
+        if len(img_array.shape) == 2:  # [H, W]
+            img_array = np.stack([img_array] * 3, axis=-1)  # [H, W, 3]
 
         # Apply transforms
         if self.transform:
-            img = self.transform(image=img)["image"]
+            img_array = self.transform(image=img_array)["image"]
 
-        label = item["label"]
-        return img, label
+        return img_array, label
 
 
 def get_datasets(
