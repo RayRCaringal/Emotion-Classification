@@ -50,3 +50,8 @@ PIN_MEMORY = True if torch.cuda.is_available() else False
 WANDB_API_KEY = os.getenv("WANDB_API_KEY")
 WANDB_PROJECT = "emotion-classification"
 WANDB_DIR = "wandb"
+
+# Linear Probe Hyperparameters
+DEFAULT_LINEAR_PROBE_LEARNING_RATE = 1e-3
+DEFAULT_LINEAR_PROBE_NUM_EPOCHS = 10
+DEFAULT_LINEAR_PROBE_BATCH_SIZE = 64  

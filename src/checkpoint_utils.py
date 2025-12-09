@@ -20,7 +20,9 @@ def load_checkpoint(
     if optimizer is not None and "optimizer_state_dict" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
+    training_type = checkpoint.get("training_type", "unknown")
     print(f"Loaded checkpoint from {checkpoint_path}")
+    print(f"Training type: {training_type}")
     print(f"Epoch: {checkpoint.get('epoch', 'N/A')}")
     print(f"Val Acc: {checkpoint.get('val_acc', 'N/A'):.4f}")
     print(f"Val F1: {checkpoint.get('val_f1', 'N/A'):.4f}")
@@ -42,7 +44,9 @@ def load_model_from_checkpoint(
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     model.load_state_dict(checkpoint["model_state_dict"])
 
-    print(f"   Loaded model from: {checkpoint_path}")
+    training_type = checkpoint.get("training_type", "unknown")
+    print(f"✅ Loaded model from: {checkpoint_path}")
+    print(f"   Training type: {training_type}")
     print(f"   Epoch: {checkpoint.get('epoch', 'N/A')}")
     print(f"   Val Acc: {checkpoint.get('val_acc', 'N/A'):.4f}")
 
@@ -58,6 +62,7 @@ def save_checkpoint(
     val_loss: float,
     val_f1: float,
     history: dict,
+    training_type: str = "full_fine_tuning",
 ) -> None:
     """
     Save a checkpoint of the training state.
@@ -80,6 +85,8 @@ def save_checkpoint(
         Validation F1 score
     history : dict
         Training history
+    training_type : str, optional
+        Type of training (full_fine_tuning or linear_probe)
     """
     torch.save(
         {
@@ -90,6 +97,7 @@ def save_checkpoint(
             "val_loss": val_loss,
             "val_f1": val_f1,
             "history": history,
+            "training_type": training_type,
         },
         save_path,
     )

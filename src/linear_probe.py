@@ -1,5 +1,5 @@
 """
-Training functions for full fine-tuning.
+Training functions for linear probe (frozen encoder, trainable classifier).
 """
 
 from pathlib import Path
@@ -11,9 +11,9 @@ from transformers import get_scheduler
 from src.backup import BackupManager
 from src.checkpoint_utils import save_checkpoint
 from src.config import (
-    DEFAULT_BATCH_SIZE,
-    DEFAULT_LEARNING_RATE,
-    DEFAULT_NUM_EPOCHS,
+    DEFAULT_LINEAR_PROBE_BATCH_SIZE,
+    DEFAULT_LINEAR_PROBE_LEARNING_RATE,
+    DEFAULT_LINEAR_PROBE_NUM_EPOCHS,
     DEFAULT_WARMUP_STEPS,
     DEVICE,
     NUM_WORKERS,
@@ -34,29 +34,51 @@ from src.wandb_utils import (
 )
 
 
-def train_model(
+def freeze_encoder(model: torch.nn.Module) -> torch.nn.Module:
+    """
+    Freeze Encoder Parameters 
+    """
+
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # Unfreeze the classifier head
+    if hasattr(model, "classifier"):
+        for param in model.classifier.parameters():
+            param.requires_grad = True
+    else:
+        raise AttributeError(
+            "Model does not have a 'classifier' attribute. "
+            "Ensure you're using ViTForImageClassification."
+        )
+
+    # Print trainable parameters
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Trainable parameters: {trainable_params:,} / {total_params:,}")
+    print(f"Percentage trainable: {100 * trainable_params / total_params:.2f}%")
+
+    return model
+
+
+def train_linear_probe(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     train_dataset: torch.utils.data.Dataset,
     val_dataset: torch.utils.data.Dataset,
-    num_epochs: int = DEFAULT_NUM_EPOCHS,
-    batch_size: int = DEFAULT_BATCH_SIZE,
+    num_epochs: int = DEFAULT_LINEAR_PROBE_NUM_EPOCHS,
+    batch_size: int = DEFAULT_LINEAR_PROBE_BATCH_SIZE,
     device: torch.device = DEVICE,
     save_path: Path = None,
-    model_name: str = "model",
+    model_name: str = "linear_probe",
     use_wandb: bool = True,
     wandb_config: dict = None,
 ) -> tuple[torch.nn.Module, dict, Path]:
     """
-    Returns
-    -------
-    model : torch.nn.Module
-        Trained model
-    history : dict
-        Dictionary with training history
-    run_folder : Path
-        Path to the run folder
+    Train model with linear probe 
     """
+    print("Freezing encoder parameters...")
+    model = freeze_encoder(model)
 
     # Create run folder FIRST to get unique name
     run_folder = get_next_folder(f"{model_name}")
@@ -65,10 +87,10 @@ def train_model(
     training_parameters = {
         "model_name": model_name,
         "model_architecture": type(model).__name__,
-        "training_type": "full_fine_tuning",
+        "training_type": "linear_probe",
         "num_epochs": num_epochs,
         "batch_size": batch_size,
-        "learning_rate": DEFAULT_LEARNING_RATE,
+        "learning_rate": DEFAULT_LINEAR_PROBE_LEARNING_RATE,
         "warmup_steps": DEFAULT_WARMUP_STEPS,
         "device": str(device),
         "num_workers": NUM_WORKERS,
@@ -82,22 +104,26 @@ def train_model(
         "run_folder": unique_run_name,
         "train_dataset_size": len(train_dataset),
         "val_dataset_size": len(val_dataset),
+        "trainable_params": sum(
+            p.numel() for p in model.parameters() if p.requires_grad
+        ),
+        "total_params": sum(p.numel() for p in model.parameters()),
     }
 
     if use_wandb:
         if wandb_config is None:
             wandb_config = {
-                "learning_rate": DEFAULT_LEARNING_RATE,
+                "learning_rate": DEFAULT_LINEAR_PROBE_LEARNING_RATE,
                 "batch_size": batch_size,
                 "epochs": num_epochs,
                 "model_name": model_name,
                 "architecture": type(model).__name__,
                 "run_folder": unique_run_name,
-                "training_type": "full_fine_tuning",
+                "training_type": "linear_probe",
             }
         else:
             wandb_config["run_folder"] = unique_run_name
-            wandb_config["training_type"] = "full_fine_tuning"
+            wandb_config["training_type"] = "linear_probe"
 
         init_wandb_run(
             project="emotion-classification",
@@ -146,7 +172,7 @@ def train_model(
     )
 
     print(f"Training {model_name} for {num_epochs} epochs...")
-    print(f"Training type: FULL FINE-TUNING")
+    print(f"Training type: LINEAR PROBE (frozen encoder)")
     print(f"Run name (WandB): {unique_run_name}")
     print(f"Total training steps: {num_training_steps}")
     print(f"Device: {device}")
@@ -236,7 +262,7 @@ def train_model(
                     val_loss=val_loss,
                     val_f1=val_f1,
                     history=history,
-                    training_type="full_fine_tuning",
+                    training_type="linear_probe",
                 )
                 print(
                     f"✅ New best model saved! (Val Acc: {val_acc:.4f}, Val F1: {val_f1:.4f})"
@@ -266,7 +292,7 @@ def train_model(
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "history": history,
-                "training_type": "full_fine_tuning",
+                "training_type": "linear_probe",
             },
             emergency_path,
         )
