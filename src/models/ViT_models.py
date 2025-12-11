@@ -27,7 +27,7 @@ class ViTModel(BaseModel):
 
         print(f"Loading pre-trained ViT model: {model_name}")
         
-        # Load HuggingFace model (PyTorch auto-registers as submodule)
+        # Load HuggingFace model
         self.model = ViTForImageClassification.from_pretrained(
             model_name,
             num_labels=num_labels,
@@ -35,10 +35,10 @@ class ViTModel(BaseModel):
             **kwargs,
         )
         
-        self.to(self.device)
-
-        self.setup_for_full_finetune()
+        self.model.eval()
         
+    def forward(self, pixel_values: torch.Tensor, labels: Optional[torch.Tensor] = None) -> dict:
+        return self.model(pixel_values=pixel_values, labels=labels)
 
     def get_classifier_parameters(self) -> List[nn.Parameter]:
         if hasattr(self.model, "classifier"):
@@ -56,7 +56,6 @@ class ViTModel(BaseModel):
 
     def get_underlying_model(self) -> nn.Module:
         return self.model
-
 
     def setup_for_lora(
         self, 
@@ -88,5 +87,3 @@ class ViTModel(BaseModel):
         lora_model.print_trainable_parameters() 
         
         return lora_model
-    
-  

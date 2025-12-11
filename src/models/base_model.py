@@ -34,6 +34,20 @@ class BaseModel(ABC, nn.Module):
         self._current_training_mode: TrainingMode = "custom"
         self._last_configured_at: Optional[datetime] = None
 
+    @abstractmethod
+    def forward(self, pixel_values: torch.Tensor, labels: Optional[torch.Tensor] = None) -> dict:
+        """
+        Forward pass of the model
+        
+        Parameters
+        ----------
+        pixel_values :
+            Input images/tensor
+        labels : 
+            Ground truth labels for training
+        """
+        pass
+
 
     @abstractmethod
     def get_classifier_parameters(self) -> List[nn.Parameter]:
