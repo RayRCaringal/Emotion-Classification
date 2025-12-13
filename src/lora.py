@@ -1,52 +1,35 @@
 """
-LoRA (Low-Rank Adaptation) training functions for Vision Transformer fine-tuning.
+LoRA (Low-Rank Adaptation) training functions for Vision Transformer fine-tuning - simplified.
 """
 
 import gc
 from pathlib import Path
-from typing import Optional
-
+from typing import Optional, Dict, Any, List
 import torch
+from torch.optim import AdamW
 from peft import LoraConfig, PeftModel
-from transformers import get_scheduler
-import wandb
-from src.evaluate import evaluate_model
-from src.backup import BackupManager
-from src.checkpoint_utils import (
-    safe_save_checkpoint,
-    safe_load_checkpoint,
-    save_model_checkpoint,
-)
+from src.checkpoint_utils import safe_save_checkpoint, safe_load_checkpoint
+from src.models.base_model import BaseModel
+from src.metadata import get_next_folder
 from src.config import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_LEARNING_RATE,
     DEFAULT_NUM_EPOCHS,
-    DEFAULT_WARMUP_STEPS,
-    DEVICE,
     NUM_WORKERS,
-    PIN_MEMORY,
 )
-from src.metadata import get_next_folder, save_training_parameters
-from src.models.base_model import BaseModel
-from src.utils.training_utils import (
-    train_epoch,
-    validate,
-    init_training_history,
-    update_history,
-    create_dataloaders,
-        create_training_parameters,
-    create_wandb_config,
-    print_training_config,
-    save_emergency_checkpoint,
+from src.utils.monitor_utils import (
+    setup_training,
+    run_training,
     finalize_training,
 )
+
 
 def save_lora_for_inference(
     lora_model: PeftModel,
     run_folder: Path,
     base_model_name: str,
     num_labels: int
-) -> dict:    
+) -> Dict[str, Optional[Path]]:
     # Clean up memory before saving
     gc.collect()
     if torch.cuda.is_available():
@@ -64,13 +47,14 @@ def save_lora_for_inference(
         print(f"❌ Failed to save LoRA adapters: {e}")
         lora_adapter_path = None
 
-    # 2. Save full checkpoint with metadata
+    # Save full checkpoint with metadata
     try:
-        # Get LoRA config
+
         lora_config_dict = {}
         if hasattr(lora_model, "peft_config") and "default" in lora_model.peft_config:
             lora_config_dict = lora_model.peft_config["default"].to_dict()
 
+        
         checkpoint_data = {
             "model_state_dict": lora_model.state_dict(),
             "lora_config": lora_config_dict,
@@ -81,19 +65,18 @@ def save_lora_for_inference(
 
         success = safe_save_checkpoint(checkpoint_data, full_checkpoint_path)
         if not success:
-            print(f"❌ Failed to save full checkpoint")
+            print(f" Failed to save full checkpoint")
             full_checkpoint_path = None
 
     except Exception as e:
-        print(f"❌ Error saving full checkpoint: {e}")
+        print(f" Error saving full checkpoint: {e}")
         full_checkpoint_path = None
 
-    # 3. Try to save merged model (optional)
     try:
-        print("🔀 Merging and saving model...")
+        print(" Merging & Saving model...")
         merged_model = lora_model.merge_and_unload()
         merged_model.save_pretrained(merged_model_path)
-        print(f"✅ Merged model saved to: {merged_model_path.name}")
+        print(f" Saved to: {merged_model_path.name}")
 
         del merged_model
         gc.collect()
@@ -112,342 +95,163 @@ def save_lora_for_inference(
 
 def train_lora_model(
     base_model: BaseModel,
-    lora_config: Optional[LoraConfig],
-    optimizer: torch.optim.Optimizer,
     train_dataset,
     val_dataset,
+    learning_rate: float,
+    weight_decay: float = 0.01,
+    lora_config: LoraConfig = None,
     num_epochs: int = DEFAULT_NUM_EPOCHS,
     batch_size: int = DEFAULT_BATCH_SIZE,
-    device: torch.device = DEVICE,
+    device: Optional[torch.device] = None,
     model_name: str = "lora_model",
     use_wandb: bool = True,
     wandb_config: Optional[dict] = None,
     gradient_accumulation_steps: int = 1,
-):
+    lora_r: int = 8,
+    lora_alpha: int = 16,
+    lora_dropout: float = 0.1,
+    target_modules: List[str] = None,
+) -> tuple[PeftModel, dict, Path]:
     """
     Train a model using LoRA.
-    
-    Returns
-    -------
-    tuple
-        (lora_model, history, run_folder)
     """
-    from src.wandb_utils import cleanup_wandb_run, init_wandb_run, log_epoch
 
-    # Setup LoRA on the base model
     print(f"🔧 Setting up LoRA on {base_model.model_name}...")
+    print(f"   LoRA Config: r={lora_config.r}, alpha={lora_config.lora_alpha}, "
+          f"dropout={lora_config.lora_dropout}")
+    print(f"   Target modules: {lora_config.target_modules}")
+    
     lora_model = base_model.setup_for_lora(lora_config)
     
-    # Get model metadata for saving
-    base_model_name = base_model.model_name
-    num_labels = base_model.num_labels
-
-    # Create run folder
-    run_folder = get_next_folder(f"{model_name}")
-    unique_run_name = run_folder.name
-
-    # Count trainable parameters
+    optimizer = AdamW(
+        lora_model.parameters(),
+        lr=learning_rate,
+        weight_decay=weight_decay
+    )
+    
     trainable_params = sum(p.numel() for p in lora_model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in lora_model.parameters())
-
-    # Create training parameters using helper
-    training_parameters = create_training_parameters(
+    
+    print(f" Optimizer created with {trainable_params:,} trainable parameters "
+          f"({(trainable_params/total_params)*100:.2f}% of total)")
+    
+    run_folder = get_next_folder(f"{model_name}_lora")
+    
+    def save_lora_adapters(epoch, model, val_acc, run_folder):
+        save_lora_for_inference(
+            lora_model=model,
+            run_folder=run_folder,
+            base_model_name=base_model.model_name,
+            num_labels=base_model.num_labels
+        )
+    
+    monitor, training_params, train_loader, val_loader, history, lr_scheduler = setup_training(
         model=lora_model,
         model_name=model_name,
         training_type="lora",
-        num_epochs=num_epochs,
-        batch_size=batch_size,
         optimizer=optimizer,
         train_dataset=train_dataset,
         val_dataset=val_dataset,
+        num_epochs=num_epochs,
+        batch_size=batch_size,
+        run_folder=run_folder,
         device=device,
-        num_workers=min(NUM_WORKERS, 4),
-        pin_memory=PIN_MEMORY,
+        use_wandb=use_wandb,
+        wandb_config=wandb_config,
         additional_params={
-            "base_model_name": base_model_name,
-            "num_labels": num_labels,
+            "base_model_name": base_model.model_name,
+            "num_labels": base_model.num_labels,
+            "learning_rate": learning_rate,
+            "weight_decay": weight_decay,
             "gradient_accumulation_steps": gradient_accumulation_steps,
-            "learning_rate": DEFAULT_LEARNING_RATE,
-            "warmup_steps": DEFAULT_WARMUP_STEPS,
-            "run_folder": unique_run_name,
+            "trainable_params": trainable_params,
+            "total_params": total_params,
+            "percentage_trainable": (trainable_params / total_params) * 100,
             "lora_config": lora_config.to_dict() if lora_config else {},
-        }
+            "lora_r": lora_config.r,
+            "lora_alpha": lora_config.lora_alpha,
+            "lora_dropout": lora_config.lora_dropout,
+            "target_modules": lora_config.target_modules,
+        },
+        num_workers=min(4, NUM_WORKERS),  # Use fewer workers for LoRA
     )
-
-    # Initialize W&B if requested
-    if use_wandb:
-        # Create base W&B config
-        wandb_config = create_wandb_config(
-            training_parameters=training_parameters,
-            training_type="lora",
-            run_name=unique_run_name,
-            custom_config=wandb_config,
-        )
-        
-        # Add LoRA-specific config if available
-        if hasattr(lora_model, "peft_config") and "default" in lora_model.peft_config:
-            config = lora_model.peft_config["default"]
-            wandb_config.update({
-                "lora_r": config.r,
-                "lora_alpha": config.lora_alpha,
-                "lora_dropout": config.lora_dropout,
-            })
-
-        init_wandb_run(
-            project="emotion-classification",
-            name=unique_run_name,
-            config=wandb_config,
-            model=lora_model,
-        )
-
-    # Create data loaders using shared utility
-    train_loader, val_loader = create_dataloaders(
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        batch_size=batch_size,
-        num_workers=min(NUM_WORKERS, 4),
-        pin_memory=PIN_MEMORY,
-    )
-
-    # Create learning rate scheduler
-    num_training_steps = num_epochs * len(train_loader)
-    lr_scheduler = get_scheduler(
-        name="linear",
-        optimizer=optimizer,
-        num_warmup_steps=DEFAULT_WARMUP_STEPS,
-        num_training_steps=num_training_steps,
-    )
-
-    training_parameters["lr_scheduler"] = {
-        "type": "linear",
-        "num_training_steps": num_training_steps,
-        "num_warmup_steps": DEFAULT_WARMUP_STEPS,
-    }
-
-    # Move model to device
-    lora_model.to(device)
-
-    # Initialize training history using shared utility
-    history = init_training_history()
-
+    
+    if device:
+        lora_model.to(device)
+    
     best_val_acc = 0.0
-    best_model_path = run_folder / f"best_{model_name}.pth"
-
-    # Save initial training parameters
-    save_training_parameters(run_folder, training_parameters)
-
-    # Setup backup manager
-    backup_manager = BackupManager(
-        run_folder=run_folder,
-        max_backups=3,
-        backup_interval=max(1, num_epochs // 4),
-    )
-
-    # Print training config using helper
-    wandb_url = wandb.run.url if use_wandb and wandb.run is not None else None
-    print_training_config(
-        model_name=type(lora_model).__name__,
-        training_type="lora",
-        param_counts=type('obj', (object,), {
-            'total': total_params,
-            'trainable': trainable_params,
-            'percentage_trainable': (trainable_params / total_params) * 100
-        }),
-        run_name=unique_run_name,
-        num_epochs=num_epochs,
-        batch_size=batch_size,
-        device=device,
-        train_loader_len=len(train_loader),
-        val_loader_len=len(val_loader),
-        run_folder=run_folder,
-        save_path=best_model_path,
-        backup_interval=backup_manager.backup_interval,
-        wandb_url=wandb_url,
-    )
-
+    
     try:
         for epoch in range(num_epochs):
-            print(f"\nEpoch {epoch + 1}/{num_epochs}")
-
-            # Clear cache at start of each epoch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                gc.collect()
-
-            # Train using shared train_epoch utility
-            (
-                train_loss,
-                train_acc,
-                train_precision,
-                train_recall,
-                train_f1,
-                train_preds,
-                train_labels,
-            ) = train_epoch(
+            train_metrics, val_metrics, best_val_acc = run_training(
+                epoch=epoch,
                 model=lora_model,
-                dataloader=train_loader,
+                train_loader=train_loader,
+                val_loader=val_loader,
                 optimizer=optimizer,
                 lr_scheduler=lr_scheduler,
-                device=device,
-                epoch=epoch,
-                log_frequency=50,  # Less frequent for LoRA
-            )
-
-            # Validate using shared validate utility
-            (
-                val_loss,
-                val_acc,
-                val_precision,
-                val_recall,
-                val_f1,
-                val_preds,
-                val_labels,
-            ) = validate(
-                model=lora_model,
-                dataloader=val_loader,
-                device=device,
-                epoch=epoch,
-            )
-
-            # Update history using shared utility
-            update_history(
+                device=lora_model.device,
                 history=history,
-                train_loss=train_loss,
-                train_acc=train_acc,
-                train_precision=train_precision,
-                train_recall=train_recall,
-                train_f1=train_f1,
-                val_loss=val_loss,
-                val_acc=val_acc,
-                val_precision=val_precision,
-                val_recall=val_recall,
-                val_f1=val_f1,
+                monitor=monitor,
+                use_wandb=use_wandb,
+                log_frequency=50,  
+                cleanup_memory=True,  
+                on_new_best_model=save_lora_adapters, 
             )
-
-            # Log to W&B
-            if use_wandb:
-                log_epoch(
-                    epoch=epoch,
-                    train_loss=train_loss,
-                    val_loss=val_loss,
-                    val_accuracy=val_acc,
-                    val_f1=val_f1,
-                    val_precision=val_precision,
-                    val_recall=val_recall,
-                    learning_rate=lr_scheduler.get_last_lr()[0],
-                )
-
-            print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
-            print(f"Val Loss:   {val_loss:.4f} | Val Acc:   {val_acc:.4f}")
-
-            # Save best model
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-
-                # Clear memory before saving
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    gc.collect()
-
-                # Save LoRA components for inference
-                save_lora_for_inference(
-                    lora_model=lora_model,
-                    run_folder=run_folder,
-                    base_model_name=base_model_name,
-                    num_labels=num_labels
-                )
-
-                # Save training checkpoint using consolidated function
-                success = save_model_checkpoint(
-                    model=base_model,  # Use base_model for metadata
-                    save_path=best_model_path,
-                    optimizer=optimizer,
-                    epoch=epoch,
-                    val_acc=val_acc,
-                    val_loss=val_loss,
-                    val_f1=val_f1,
-                    history=history,
-                    additional_data={
-                        "training_parameters": training_parameters,
-                        "best_val_acc": best_val_acc,
-                        "lora_model_state": lora_model.state_dict(),
-                    },
-                )
-                
-                if success:
-                    print(f"✅ Best model checkpoint saved")
-
-            # Create backup if needed
-            if backup_manager.should_backup(epoch):
-                print("📦 Creating backup...")
-                backup_path = backup_manager.create_backup(
-                    model=lora_model,
-                    optimizer=optimizer,
-                    epoch=epoch,
-                    history=history,
-                    val_acc=val_acc,
-                    val_loss=val_loss,
-                )
-                if backup_path:
-                    print(f"✅ Backup created: {backup_path.name}")
-
-            # Clear memory between epochs
+            
+            print(f"Epoch {epoch+1}/{num_epochs}: "
+                  f"Train Loss: {train_metrics['loss']:.4f}, "
+                  f"Val Acc: {val_metrics['accuracy']:.4f}")
+            
+            # Clean memory between epochs
             gc.collect()
-
-    except KeyboardInterrupt:
-        print(f"\n⚠️ Training interrupted by user at epoch {epoch if 'epoch' in locals() else 'unknown'}")
-
-    except Exception as e:
-        print(f"\n❌ Training interrupted with error: {e}")
-        import traceback
-        traceback.print_exc()
-
-    finally:
-        # Always save emergency checkpoint using helper
-        save_emergency_checkpoint(
+        
+        finalize_training(
             model=lora_model,
             optimizer=optimizer,
-            epoch=epoch if "epoch" in locals() else 0,
             history=history,
-            training_parameters=training_parameters,
-            run_folder=run_folder,
-            run_name=unique_run_name,
+            training_parameters=training_params,
+            monitor=monitor,
+            best_val_acc=best_val_acc,
+            use_wandb=use_wandb,
+            lr_scheduler=lr_scheduler,
         )
-
-        if use_wandb:
-            cleanup_wandb_run()
-
-    # Finalize training using helper
-    finalize_training(
-        model=lora_model,
-        optimizer=optimizer,
-        history=history,
-        training_parameters=training_parameters,
-        run_folder=run_folder,
-        backup_manager=backup_manager,
-        best_val_acc=best_val_acc,
-        use_wandb=use_wandb,
-    )
-
+        
+    except KeyboardInterrupt:
+        print(f"\n Training interrupted")
+        monitor.save_emergency_checkpoint(
+            model=lora_model,
+            optimizer=optimizer,
+            history=history,
+            training_parameters=training_params,
+            lr_scheduler=lr_scheduler,
+        )
+        raise
+        
+    except Exception as e:
+        print(f"\n Training error: {e}")
+        monitor.save_emergency_checkpoint(
+            model=lora_model,
+            optimizer=optimizer,
+            history=history,
+            training_parameters=training_params,
+            lr_scheduler=lr_scheduler,
+        )
+        raise
+    
     return lora_model, history, run_folder
 
 
 def load_lora_model_for_inference(
     run_folder: Path,
     base_model: BaseModel,
-    device: torch.device = DEVICE,
+    device: torch.device = "cuda" if torch.cuda.is_available() else "cpu",
     load_method: str = "auto"
 ) -> torch.nn.Module:
     """
     Load a trained LoRA model for inference.
-    
-    Parameters
-    ----------
-    load_method : str
-        Loading strategy: "auto", "merged", or "lora"
-        
     """
-    print(f" Loading LoRA model from: {run_folder.name}")
+    print(f"Loading LoRA model from: {run_folder.name}")
 
     lora_adapter_path = run_folder / "lora_adapter"
     full_checkpoint_path = run_folder / "best_lora_model.pth"
@@ -455,7 +259,7 @@ def load_lora_model_for_inference(
 
     # 1. Try merged model first (fastest for inference)
     if load_method in ["auto", "merged"] and merged_model_path.exists():
-        print("🔀 Loading merged model...")
+        print(" Loading merged model...")
         try:
             from transformers import ViTForImageClassification
             
@@ -476,11 +280,8 @@ def load_lora_model_for_inference(
         try:
             # Get the underlying model for PEFT operations
             underlying_model = base_model.get_underlying_model()
-            
-            # Load LoRA adapters onto base model
             lora_model = PeftModel.from_pretrained(underlying_model, lora_adapter_path)
             
-            # Merge adapters into base weights
             merged_model = lora_model.merge_and_unload()
             
             # Load full state dict if checkpoint exists
@@ -494,11 +295,11 @@ def load_lora_model_for_inference(
 
             merged_model.to(device)
             merged_model.eval()
-            print("✅ Loaded and merged LoRA model successfully")
+            print("Loaded and merged LoRA model successfully")
             return merged_model
 
         except Exception as e:
-            print(f"❌ Failed to load LoRA model: {e}")
+            print(f"Failed to load LoRA model: {e}")
             if load_method == "lora":
                 raise
 

@@ -5,7 +5,7 @@ Creates Backup checkpoints in case of Training Failure.
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Dict
 
 import torch
 
@@ -43,43 +43,64 @@ class BackupManager:
         history: dict[str, Any],
         val_acc: float,
         val_loss: float,
+        lr_scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+        additional_data: Optional[Dict[str, Any]] = None,
         is_final: bool = False,
-    ) -> Path:
-        backup_type = "final" if is_final else f"epoch_{epoch:03d}"
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_name = f"backup_{backup_type}_{timestamp}.pth"
-        backup_path = self.backups_dir / backup_name
+    ) -> Optional[Path]:
+      
+        try:
+            backup_type = "final" if is_final else f"epoch_{epoch:03d}"
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_name = f"backup_{backup_type}_{timestamp}.pth"
+            backup_path = self.backups_dir / backup_name
 
-        checkpoint = {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "history": history,
-            "val_acc": val_acc,
-            "val_loss": val_loss,
-            "timestamp": datetime.now().isoformat(),
-            "backup_type": backup_type,
-            "is_final": is_final,
-        }
+            checkpoint = {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "history": history,
+                "val_acc": val_acc,
+                "val_loss": val_loss,
+                "timestamp": datetime.now().isoformat(),
+                "backup_type": backup_type,
+                "is_final": is_final,
+            }
+            
+            if lr_scheduler is not None:
+                checkpoint["lr_scheduler_state_dict"] = lr_scheduler.state_dict()
+                checkpoint["lr_scheduler_type"] = type(lr_scheduler).__name__
+            
+            if additional_data:
+                checkpoint["additional_data"] = additional_data
 
-        torch.save(checkpoint, backup_path)
+            torch.save(checkpoint, backup_path)
 
-        # Backup JSON
-        backup_info = {
-            "backup_path": str(backup_path),
-            "epoch": epoch,
-            "val_acc": val_acc,
-            "val_loss": val_loss,
-            "timestamp": checkpoint["timestamp"],
-            "backup_type": backup_type,
-            "is_final": is_final,
-        }
+            # Create JSON metadata file
+            backup_info = {
+                "backup_path": str(backup_path),
+                "epoch": epoch,
+                "val_acc": val_acc,
+                "val_loss": val_loss,
+                "timestamp": checkpoint["timestamp"],
+                "backup_type": backup_type,
+                "is_final": is_final,
+                "has_lr_scheduler": lr_scheduler is not None,
+                "has_additional_data": additional_data is not None,
+                "lr_scheduler_type": type(lr_scheduler).__name__ if lr_scheduler else None,
+            }
 
-        info_path = backup_path.with_suffix(".json")
-        with open(info_path, "w") as f:
-            json.dump(backup_info, f, indent=2)
+            info_path = backup_path.with_suffix(".json")
+            with open(info_path, "w") as f:
+                json.dump(backup_info, f, indent=2)
 
-        return backup_path
+            # Clean up old backups
+            self.cleanup_old_backups()
+            
+            return backup_path
+            
+        except Exception as e:
+            print(f"Error creating backup: {e}")
+            return None
 
     def cleanup_old_backups(self) -> int:
         """
@@ -156,7 +177,7 @@ class BackupManager:
                 json_file.unlink(missing_ok=True)
 
                 deleted_count += 1
-                print(f"🧹 Deleted backup: {pth_file.name}")
+                print(f"Deleted backup: {pth_file.name}")
 
             print(f"Deleted all {deleted_count} backup files after successful training")
             return deleted_count
@@ -171,17 +192,20 @@ class BackupManager:
         for backup_path in self.backups_dir.glob("backup_*.pth"):
             info_path = backup_path.with_suffix(".json")
 
-            # Shouldn't be an issue, but just in case filter for json
             if info_path.exists():
-                with open(info_path) as f:
-                    backup_info = json.load(f)
-                backups.append(backup_info)
+                try:
+                    with open(info_path) as f:
+                        backup_info = json.load(f)
+                    backups.append(backup_info)
+                except json.JSONDecodeError as e:
+                    print(f"Error reading backup info {info_path}: {e}")
+                    continue
 
         backups.sort(key=lambda x: x["epoch"], reverse=True)
 
         return backups
 
-    def get_latest_backup(self) -> Path | None:
+    def get_latest_backup(self) -> Optional[Path]:
         backups = self.list_backups()
         if not backups:
             return None
@@ -192,8 +216,9 @@ class BackupManager:
     def restore_backup(
         self,
         model: torch.nn.Module,
-        optimizer: torch.optim.Optimizer | None = None,
-        backup_path: Path | None = None,
+        optimizer: Optional[torch.optim.Optimizer] = None,
+        lr_scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+        backup_path: Optional[Path] = None,
     ) -> dict[str, Any]:
         if backup_path is None:
             backup_path = self.get_latest_backup()
@@ -202,18 +227,35 @@ class BackupManager:
             raise FileNotFoundError(f"No backup found at {backup_path}")
 
         checkpoint = torch.load(backup_path, map_location="cpu")
-
         model.load_state_dict(checkpoint["model_state_dict"])
 
         if optimizer is not None and "optimizer_state_dict" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            print(f"    Restored optimizer state")
+        if lr_scheduler is not None and "lr_scheduler_state_dict" in checkpoint:
+            lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state_dict"])
+            print(f"    Restored learning rate scheduler state")
+        elif lr_scheduler is not None and "lr_scheduler_state_dict" not in checkpoint:
+            print(f"    Note: Backup does not contain lr_scheduler state")
 
         print(f"    Restored from backup: {backup_path.name}")
         print(f"    Epoch: {checkpoint['epoch']}")
         print(f"    Val Acc: {checkpoint['val_acc']:.4f}")
         print(f"    Timestamp: {checkpoint['timestamp']}")
+        
+        if "additional_data" in checkpoint:
+            print(f"    Backup contains additional data")
 
         return checkpoint
+
+    def get_backup_info(self, backup_path: Path) -> Dict[str, Any]:
+        info_path = backup_path.with_suffix(".json")
+        
+        if not info_path.exists():
+            raise FileNotFoundError(f"No metadata found for backup: {backup_path}")
+        
+        with open(info_path) as f:
+            return json.load(f)
 
 
 def resume_training(
@@ -222,19 +264,29 @@ def resume_training(
     optimizer: torch.optim.Optimizer,
     train_dataset: torch.utils.data.Dataset,
     val_dataset: torch.utils.data.Dataset,
-    backup_path: Path | None = None,
+    lr_scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+    backup_path: Optional[Path] = None,
     **train_kwargs,
 ) -> tuple[torch.nn.Module, dict, Path]:
     backup_manager = BackupManager(run_folder)
 
     checkpoint = backup_manager.restore_backup(
-        model=model, optimizer=optimizer, backup_path=backup_path
+        model=model, 
+        optimizer=optimizer, 
+        lr_scheduler=lr_scheduler,
+        backup_path=backup_path
     )
+    
     resumed_epoch = checkpoint["epoch"] + 1
+    print(f"Resuming from epoch {resumed_epoch}")
+    
     if "num_epochs" in train_kwargs:
-        print(f" Resuming from epoch {resumed_epoch} to {train_kwargs['num_epochs']}")
+        print(f"Training will continue to epoch {train_kwargs['num_epochs']}")
+    
 
-    # to avoid circular imports
+    train_kwargs["starting_epoch"] = resumed_epoch
+
+    # To avoid circular imports
     from .train import train_model
 
     return train_model(
